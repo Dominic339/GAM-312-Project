@@ -5,11 +5,16 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Character.h"
 #include "InputActionValue.h"
+#include "BuildingTypes.h"
 #include "SurvivalCharacter.generated.h"
 
 class UCameraComponent;
 class UInputMappingContext;
 class UInputAction;
+class ABuildableObject;
+class UBuildMenuWidget;
+class UPlayerStatWidget;
+class UObjectiveWidget;
 
 /**
  * First-person player character for the survival game.
@@ -20,11 +25,19 @@ class UInputAction;
  *   - Resource inventory: Wood, Stone, Berry incremented on collection
  *   - Line-trace interaction: pressing E fires a trace and calls Interact()
  *     on any AInteractableObject within range
+ *   - Building system: opens a build menu widget, spawns a ghost preview of
+ *     the selected shelter piece (Wall/Floor/Ceiling), and places it via a
+ *     second trace once the player can afford its resource cost
  *
  * Setup in the editor:
  *   1. Derive BP_SurvivalCharacter from this class.
- *   2. Assign IMC_Default, IA_Move, IA_Look, IA_Interact in the Details panel.
+ *   2. Assign IMC_Default, IA_Move, IA_Look, IA_Interact, IA_ToggleBuild,
+ *      IA_PlaceBuildable in the Details panel.
  *   3. Set BP_SurvivalCharacter as the Default Pawn Class in the Game Mode.
+ *   4. Assign WallClass/FloorClass/CeilingClass (BP_Wall/BP_Floor/BP_Ceiling)
+ *      and BuildMenuWidgetClass (WBP_BuildMenu) in the Details panel.
+ *   5. Assign PlayerStatWidgetClass (WBP_PlayerStatHUD) in the Details panel.
+ *   6. Assign ObjectiveWidgetClass (WBP_ObjectiveHUD) in the Details panel.
  */
 UCLASS()
 class GAM312_COLLINS_API ASurvivalCharacter : public ACharacter
@@ -64,6 +77,14 @@ private:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input", meta = (AllowPrivateAccess = "true"))
 	UInputAction* InteractAction;
 
+	// Digital (bool) action — bound to a key (e.g. B); opens/closes the build menu, or cancels an active placement
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input", meta = (AllowPrivateAccess = "true"))
+	UInputAction* ToggleBuildMenuAction;
+
+	// Digital (bool) action — bound to a key/mouse button; confirms placement of the currently previewed piece
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input", meta = (AllowPrivateAccess = "true"))
+	UInputAction* PlaceBuildableAction;
+
 	// ── Player Stats ──────────────────────────────────────────────────────────
 
 	// Current health — drains when hunger reaches zero; game over at 0
@@ -102,6 +123,14 @@ private:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats", meta = (AllowPrivateAccess = "true"))
 	float StaminaRestoreRate;
 
+	// Widget Blueprint to instantiate as the always-on stat HUD (assign WBP_PlayerStatHUD)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stats", meta = (AllowPrivateAccess = "true"))
+	TSubclassOf<UPlayerStatWidget> PlayerStatWidgetClass;
+
+	// The stat HUD widget instance; created once in BeginPlay and refreshed every tick
+	UPROPERTY(Transient)
+	UPlayerStatWidget* PlayerStatWidgetInstance;
+
 	// ── Resource Inventory ────────────────────────────────────────────────────
 
 	// Units of wood collected from trees
@@ -122,6 +151,83 @@ private:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Interaction", meta = (AllowPrivateAccess = "true"))
 	float InteractRange;
 
+	// ── Building System ───────────────────────────────────────────────────────
+
+	// Blueprint child of ABuildableObject to spawn when the player selects "Wall" (assign BP_Wall)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Building", meta = (AllowPrivateAccess = "true"))
+	TSubclassOf<ABuildableObject> WallClass;
+
+	// Blueprint child of ABuildableObject to spawn when the player selects "Floor" (assign BP_Floor)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Building", meta = (AllowPrivateAccess = "true"))
+	TSubclassOf<ABuildableObject> FloorClass;
+
+	// Blueprint child of ABuildableObject to spawn when the player selects "Ceiling" (assign BP_Ceiling)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Building", meta = (AllowPrivateAccess = "true"))
+	TSubclassOf<ABuildableObject> CeilingClass;
+
+	// Widget Blueprint to instantiate as the build menu HUD (assign WBP_BuildMenu)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Building", meta = (AllowPrivateAccess = "true"))
+	TSubclassOf<UBuildMenuWidget> BuildMenuWidgetClass;
+
+	// Resources required to place one Wall
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Building", meta = (AllowPrivateAccess = "true"))
+	FBuildingCost WallCost;
+
+	// Resources required to place one Floor
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Building", meta = (AllowPrivateAccess = "true"))
+	FBuildingCost FloorCost;
+
+	// Resources required to place one Ceiling
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Building", meta = (AllowPrivateAccess = "true"))
+	FBuildingCost CeilingCost;
+
+	// Maximum distance (cm) at which a shelter piece can be placed
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Building", meta = (AllowPrivateAccess = "true"))
+	float BuildPlacementRange;
+
+	// The build menu widget instance; created once in BeginPlay and shown/hidden by ToggleBuildMenu()
+	UPROPERTY(Transient)
+	UBuildMenuWidget* BuildMenuWidgetInstance;
+
+	// Whether the build menu widget is currently visible
+	bool bBuildMenuOpen;
+
+	// Which piece the player is currently placing; None means no active placement
+	EBuildPieceType SelectedBuildType;
+
+	// The ghost/preview actor following the player's trace while placing (nullptr when not placing)
+	UPROPERTY(Transient)
+	ABuildableObject* PreviewActor;
+
+	// Whether the last placement trace hit a valid surface; gates TryPlaceBuildable()
+	bool bLastBuildTraceValid;
+
+	// ── Objectives ────────────────────────────────────────────────────────────
+
+	// Total Wood + Stone ever collected (lifetime count, not current inventory)
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Objectives", meta = (AllowPrivateAccess = "true"))
+	int32 MaterialsCollected;
+
+	// Target materials count for the "Collect materials" objective
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Objectives", meta = (AllowPrivateAccess = "true"))
+	int32 MaterialsGoal;
+
+	// Total shelter pieces (Wall/Floor/Ceiling) successfully placed
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Objectives", meta = (AllowPrivateAccess = "true"))
+	int32 PartsBuilt;
+
+	// Target parts count for the "Build parts" objective
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Objectives", meta = (AllowPrivateAccess = "true"))
+	int32 PartsGoal;
+
+	// Widget Blueprint to instantiate as the always-on objective HUD (assign WBP_ObjectiveHUD)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Objectives", meta = (AllowPrivateAccess = "true"))
+	TSubclassOf<UObjectiveWidget> ObjectiveWidgetClass;
+
+	// The objective HUD widget instance; created once in BeginPlay and refreshed whenever progress changes
+	UPROPERTY(Transient)
+	UObjectiveWidget* ObjectiveWidgetInstance;
+
 	// ── Movement ──────────────────────────────────────────────────────────────
 
 	// Top walking speed in cm/s; tunable in Blueprint Details
@@ -138,6 +244,33 @@ private:
 
 	// Fires a line trace from the camera; calls Interact() on any hit interactable
 	void TryInteract();
+
+	// Opens/closes the build menu widget; cancels an active placement instead if one is in progress
+	void ToggleBuildMenu();
+
+	// Confirms placement of the current preview at its last valid trace location, if affordable
+	void TryPlaceBuildable();
+
+	// Moves/rotates the active preview actor to follow a trace from the camera each tick
+	void UpdateBuildPreview();
+
+	// Spawns a fresh ghost-preview actor of the given type at the player's location
+	void SpawnPreviewActor(EBuildPieceType Type);
+
+	// Destroys the active preview actor, if any
+	void ClearPreviewActor();
+
+	// Cancels the current placement and returns to the no-selection state
+	void CancelBuildPlacement();
+
+	// Pushes fresh inventory/cost text to the build menu widget, if it exists
+	void RefreshBuildMenuDisplay();
+
+	// Pushes fresh progress/completion state to the objective HUD widget, if it exists
+	void RefreshObjectiveHUD();
+
+	// Maps a build piece type to its configured Blueprint class (WallClass/FloorClass/CeilingClass)
+	TSubclassOf<ABuildableObject> GetBuildableClass(EBuildPieceType Type) const;
 
 	// Decreases Hunger each frame; clamps to [0, MaxHunger]
 	void UpdateHunger(float DeltaTime);
@@ -165,4 +298,53 @@ public:
 
 	/** Add Amount units of berry to the inventory */
 	void AddBerry(int32 Amount);
+
+	// ── Public Interface (used by UPlayerStatWidget) ───────────────────────────
+
+	/** Current health as a 0..1 fraction, for the stat HUD progress bar */
+	float GetHealthPercent() const { return MaxHealth > 0.f ? Health / MaxHealth : 0.f; }
+
+	/** Current hunger as a 0..1 fraction, for the stat HUD progress bar */
+	float GetHungerPercent() const { return MaxHunger > 0.f ? Hunger / MaxHunger : 0.f; }
+
+	/** Current stamina as a 0..1 fraction, for the stat HUD progress bar */
+	float GetStaminaPercent() const { return MaxStamina > 0.f ? Stamina / MaxStamina : 0.f; }
+
+	// ── Public Interface (used by UBuildMenuWidget) ────────────────────────────
+
+	/** Read-only access to current wood count for the build menu display */
+	int32 GetWood() const { return Wood; }
+
+	/** Read-only access to current stone count for the build menu display */
+	int32 GetStone() const { return Stone; }
+
+	/** Returns the configured resource cost for the given build piece type */
+	FBuildingCost GetBuildCost(EBuildPieceType Type) const;
+
+	/** Returns true if the current inventory covers the cost of the given build piece type */
+	bool CanAffordBuild(EBuildPieceType Type) const;
+
+	/**
+	 * Called by UBuildMenuWidget when the player clicks a build button.
+	 * Closes the menu, restores game input, and spawns a ghost preview of Type
+	 * for the player to aim and place.
+	 */
+	void SelectBuildPiece(EBuildPieceType Type);
+
+	// ── Public Interface (used by UObjectiveWidget) ────────────────────────────
+
+	/** Lifetime Wood + Stone collected, for the "collect materials" objective */
+	int32 GetMaterialsCollected() const { return MaterialsCollected; }
+
+	/** Target materials count for the "collect materials" objective */
+	int32 GetMaterialsGoal() const { return MaterialsGoal; }
+
+	/** Total shelter pieces placed, for the "build parts" objective */
+	int32 GetPartsBuilt() const { return PartsBuilt; }
+
+	/** Target parts count for the "build parts" objective */
+	int32 GetPartsGoal() const { return PartsGoal; }
+
+	/** True once both the materials and parts objectives have been met */
+	bool AreAllObjectivesComplete() const { return MaterialsCollected >= MaterialsGoal && PartsBuilt >= PartsGoal; }
 };

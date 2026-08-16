@@ -8,6 +8,11 @@
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
 #include "InteractableObject.h"
+#include "BuildableObject.h"
+#include "BuildMenuWidget.h"
+#include "PlayerStatWidget.h"
+#include "ObjectiveWidget.h"
+#include "Blueprint/UserWidget.h"
 #include "DrawDebugHelpers.h"
 
 ASurvivalCharacter::ASurvivalCharacter()
@@ -53,6 +58,33 @@ ASurvivalCharacter::ASurvivalCharacter()
 	// ── Interaction ──────────────────────────────────────────────────────────
 	// 300 cm (3 m) — close enough to feel physical, far enough to be comfortable
 	InteractRange = 300.f;
+
+	// ── Building System ──────────────────────────────────────────────────────
+	// 500 cm (5 m) — a bit further than interaction range so shelters can be placed at arm's length
+	BuildPlacementRange = 500.f;
+
+	// Default costs; tune per-type in the Blueprint Details panel
+	WallCost.WoodCost    = 3;
+	WallCost.StoneCost   = 1;
+	FloorCost.WoodCost   = 4;
+	FloorCost.StoneCost  = 0;
+	CeilingCost.WoodCost = 3;
+	CeilingCost.StoneCost = 2;
+
+	BuildMenuWidgetInstance = nullptr;
+	bBuildMenuOpen          = false;
+	SelectedBuildType       = EBuildPieceType::None;
+	PreviewActor            = nullptr;
+	bLastBuildTraceValid    = false;
+
+	PlayerStatWidgetInstance = nullptr;
+
+	// ── Objectives ────────────────────────────────────────────────────────────
+	MaterialsCollected = 0;
+	MaterialsGoal      = 500;
+	PartsBuilt         = 0;
+	PartsGoal          = 5;
+	ObjectiveWidgetInstance = nullptr;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -75,6 +107,42 @@ void ASurvivalCharacter::BeginPlay()
 			// Priority 0 — our only active context
 			Subsystem->AddMappingContext(DefaultMappingContext, 0);
 		}
+
+		// Create the build menu widget once and keep it hidden until the player opens it
+		if (BuildMenuWidgetClass)
+		{
+			BuildMenuWidgetInstance = CreateWidget<UBuildMenuWidget>(PC, BuildMenuWidgetClass);
+			if (BuildMenuWidgetInstance)
+			{
+				BuildMenuWidgetInstance->OwningCharacter = this;
+				BuildMenuWidgetInstance->AddToViewport();
+				BuildMenuWidgetInstance->SetVisibility(ESlateVisibility::Collapsed);
+			}
+		}
+
+		// Create the stat HUD and leave it visible for the whole match — Tick() keeps it refreshed
+		if (PlayerStatWidgetClass)
+		{
+			PlayerStatWidgetInstance = CreateWidget<UPlayerStatWidget>(PC, PlayerStatWidgetClass);
+			if (PlayerStatWidgetInstance)
+			{
+				PlayerStatWidgetInstance->OwningCharacter = this;
+				PlayerStatWidgetInstance->AddToViewport();
+				PlayerStatWidgetInstance->UpdateStats();
+			}
+		}
+
+		// Create the objective HUD and leave it visible for the whole match
+		if (ObjectiveWidgetClass)
+		{
+			ObjectiveWidgetInstance = CreateWidget<UObjectiveWidget>(PC, ObjectiveWidgetClass);
+			if (ObjectiveWidgetInstance)
+			{
+				ObjectiveWidgetInstance->OwningCharacter = this;
+				ObjectiveWidgetInstance->AddToViewport();
+				ObjectiveWidgetInstance->UpdateObjectives();
+			}
+		}
 	}
 }
 
@@ -91,6 +159,18 @@ void ASurvivalCharacter::Tick(float DeltaTime)
 	UpdateHunger(DeltaTime);
 	UpdateHealth(DeltaTime);
 	UpdateStamina(DeltaTime);
+
+	// Refresh the stat HUD every tick so its progress bars track the stats above in real time
+	if (PlayerStatWidgetInstance)
+	{
+		PlayerStatWidgetInstance->UpdateStats();
+	}
+
+	// While a piece is selected, keep its ghost preview following the player's aim
+	if (SelectedBuildType != EBuildPieceType::None)
+	{
+		UpdateBuildPreview();
+	}
 }
 
 void ASurvivalCharacter::UpdateHunger(float DeltaTime)
@@ -135,6 +215,12 @@ void ASurvivalCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputC
 
 		// Started fires once per key press — single interaction per press is intentional
 		EIC->BindAction(InteractAction, ETriggerEvent::Started,   this, &ASurvivalCharacter::TryInteract);
+
+		// Started fires once per key press — opens/closes the build menu, or cancels a placement in progress
+		EIC->BindAction(ToggleBuildMenuAction, ETriggerEvent::Started, this, &ASurvivalCharacter::ToggleBuildMenu);
+
+		// Started fires once per press — confirms placement of the currently previewed piece
+		EIC->BindAction(PlaceBuildableAction,  ETriggerEvent::Started, this, &ASurvivalCharacter::TryPlaceBuildable);
 	}
 }
 
@@ -222,6 +308,12 @@ void ASurvivalCharacter::AddWood(int32 Amount)
 	if (Amount > 0)
 	{
 		Wood += Amount;
+
+		// Wood counts toward the "collect materials" objective; Berry does not (it's food, not a building material)
+		MaterialsCollected += Amount;
+
+		RefreshBuildMenuDisplay();
+		RefreshObjectiveHUD();
 	}
 }
 
@@ -231,6 +323,10 @@ void ASurvivalCharacter::AddStone(int32 Amount)
 	if (Amount > 0)
 	{
 		Stone += Amount;
+		MaterialsCollected += Amount;
+
+		RefreshBuildMenuDisplay();
+		RefreshObjectiveHUD();
 	}
 }
 
@@ -241,4 +337,210 @@ void ASurvivalCharacter::AddBerry(int32 Amount)
 	{
 		Berry += Amount;
 	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Building system
+// ─────────────────────────────────────────────────────────────────────────────
+
+void ASurvivalCharacter::ToggleBuildMenu()
+{
+	// If the player is mid-placement, this key cancels that instead of toggling the menu
+	if (SelectedBuildType != EBuildPieceType::None)
+	{
+		CancelBuildPlacement();
+		return;
+	}
+
+	if (!BuildMenuWidgetInstance)
+	{
+		return;
+	}
+
+	bBuildMenuOpen = !bBuildMenuOpen;
+
+	APlayerController* PC = Cast<APlayerController>(GetController());
+
+	if (bBuildMenuOpen)
+	{
+		// Refresh costs/inventory right before showing so the display is never stale
+		RefreshBuildMenuDisplay();
+		BuildMenuWidgetInstance->SetVisibility(ESlateVisibility::Visible);
+
+		if (PC)
+		{
+			// Show the cursor and let clicks reach the widget while keeping the game world ticking
+			PC->SetInputMode(FInputModeGameAndUI());
+			PC->bShowMouseCursor = true;
+		}
+	}
+	else
+	{
+		BuildMenuWidgetInstance->SetVisibility(ESlateVisibility::Collapsed);
+
+		if (PC)
+		{
+			PC->SetInputMode(FInputModeGameOnly());
+			PC->bShowMouseCursor = false;
+		}
+	}
+}
+
+void ASurvivalCharacter::SelectBuildPiece(EBuildPieceType Type)
+{
+	// Close the menu and hand control back to the game world so the player can aim the preview
+	bBuildMenuOpen = false;
+	if (BuildMenuWidgetInstance)
+	{
+		BuildMenuWidgetInstance->SetVisibility(ESlateVisibility::Collapsed);
+	}
+
+	if (APlayerController* PC = Cast<APlayerController>(GetController()))
+	{
+		PC->SetInputMode(FInputModeGameOnly());
+		PC->bShowMouseCursor = false;
+	}
+
+	SelectedBuildType = Type;
+	SpawnPreviewActor(Type);
+}
+
+void ASurvivalCharacter::SpawnPreviewActor(EBuildPieceType Type)
+{
+	// Replace any existing preview — only one piece can be aimed at a time
+	ClearPreviewActor();
+
+	const TSubclassOf<ABuildableObject> ClassToSpawn = GetBuildableClass(Type);
+	if (!ClassToSpawn)
+	{
+		return;
+	}
+
+	FActorSpawnParameters SpawnParams;
+	// The preview has no collision yet, but AlwaysSpawn avoids any edge-case spawn failures
+	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+	PreviewActor = GetWorld()->SpawnActor<ABuildableObject>(ClassToSpawn, GetActorLocation(), FRotator::ZeroRotator, SpawnParams);
+	if (PreviewActor)
+	{
+		PreviewActor->SetPreviewMode(true);
+	}
+}
+
+void ASurvivalCharacter::ClearPreviewActor()
+{
+	if (PreviewActor)
+	{
+		PreviewActor->Destroy();
+		PreviewActor = nullptr;
+	}
+}
+
+void ASurvivalCharacter::CancelBuildPlacement()
+{
+	ClearPreviewActor();
+	SelectedBuildType    = EBuildPieceType::None;
+	bLastBuildTraceValid = false;
+}
+
+void ASurvivalCharacter::UpdateBuildPreview()
+{
+	if (!PreviewActor)
+	{
+		return;
+	}
+
+	// Same trace-from-camera approach as TryInteract, but at building range instead of interact range
+	const FVector TraceStart = FirstPersonCamera->GetComponentLocation();
+	const FVector TraceEnd   = TraceStart + (FirstPersonCamera->GetForwardVector() * BuildPlacementRange);
+
+	FHitResult HitResult;
+	FCollisionQueryParams QueryParams;
+	QueryParams.AddIgnoredActor(this);
+	QueryParams.AddIgnoredActor(PreviewActor);
+
+	bLastBuildTraceValid = GetWorld()->LineTraceSingleByChannel(HitResult, TraceStart, TraceEnd, ECC_Visibility, QueryParams);
+
+	if (bLastBuildTraceValid)
+	{
+		// Snap the ghost to the hit point and orient it to the surface it's resting against
+		PreviewActor->SetActorLocation(HitResult.Location);
+		PreviewActor->SetActorRotation(HitResult.Normal.Rotation());
+	}
+}
+
+void ASurvivalCharacter::TryPlaceBuildable()
+{
+	// Nothing to place if no piece is selected, no preview exists, or the last trace missed
+	if (SelectedBuildType == EBuildPieceType::None || !PreviewActor || !bLastBuildTraceValid)
+	{
+		return;
+	}
+
+	if (!CanAffordBuild(SelectedBuildType))
+	{
+		// Not enough resources yet — leave the preview active so the player can go collect more
+		return;
+	}
+
+	const FBuildingCost Cost = GetBuildCost(SelectedBuildType);
+	Wood  -= Cost.WoodCost;
+	Stone -= Cost.StoneCost;
+
+	// Lock the preview in as a real, fully-collidable piece of the shelter
+	PreviewActor->SetPreviewMode(false);
+	PreviewActor = nullptr;
+
+	// Every successfully placed piece counts toward the "build parts" objective
+	PartsBuilt += 1;
+
+	RefreshBuildMenuDisplay();
+	RefreshObjectiveHUD();
+
+	// Spawn a fresh preview of the same type so the player can keep building without reopening the menu
+	SpawnPreviewActor(SelectedBuildType);
+}
+
+void ASurvivalCharacter::RefreshBuildMenuDisplay()
+{
+	if (BuildMenuWidgetInstance)
+	{
+		BuildMenuWidgetInstance->UpdateInventoryDisplay();
+	}
+}
+
+void ASurvivalCharacter::RefreshObjectiveHUD()
+{
+	if (ObjectiveWidgetInstance)
+	{
+		ObjectiveWidgetInstance->UpdateObjectives();
+	}
+}
+
+TSubclassOf<ABuildableObject> ASurvivalCharacter::GetBuildableClass(EBuildPieceType Type) const
+{
+	switch (Type)
+	{
+		case EBuildPieceType::Wall:    return WallClass;
+		case EBuildPieceType::Floor:   return FloorClass;
+		case EBuildPieceType::Ceiling: return CeilingClass;
+		default:                       return nullptr;
+	}
+}
+
+FBuildingCost ASurvivalCharacter::GetBuildCost(EBuildPieceType Type) const
+{
+	switch (Type)
+	{
+		case EBuildPieceType::Wall:    return WallCost;
+		case EBuildPieceType::Floor:   return FloorCost;
+		case EBuildPieceType::Ceiling: return CeilingCost;
+		default:                       return FBuildingCost();
+	}
+}
+
+bool ASurvivalCharacter::CanAffordBuild(EBuildPieceType Type) const
+{
+	const FBuildingCost Cost = GetBuildCost(Type);
+	return Wood >= Cost.WoodCost && Stone >= Cost.StoneCost;
 }
