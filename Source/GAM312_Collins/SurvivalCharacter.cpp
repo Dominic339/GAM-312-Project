@@ -12,6 +12,7 @@
 #include "BuildMenuWidget.h"
 #include "PlayerStatWidget.h"
 #include "ObjectiveWidget.h"
+#include "EndGameWidget.h"
 #include "Blueprint/UserWidget.h"
 #include "DrawDebugHelpers.h"
 
@@ -85,6 +86,12 @@ ASurvivalCharacter::ASurvivalCharacter()
 	PartsBuilt         = 0;
 	PartsGoal          = 5;
 	ObjectiveWidgetInstance = nullptr;
+
+	// ── Win/Lose ──────────────────────────────────────────────────────────────
+	// 10 minutes to collect materials and build parts; tune in Blueprint Details
+	TimeLimit     = 600.f;
+	TimeRemaining = TimeLimit;
+	bGameOver     = false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -97,6 +104,9 @@ void ASurvivalCharacter::BeginPlay()
 
 	// Apply the configured walk speed to the movement component
 	GetCharacterMovement()->MaxWalkSpeed = WalkSpeed;
+
+	// Re-sync in case TimeLimit was tuned in the Blueprint Details panel after the C++ constructor ran
+	TimeRemaining = TimeLimit;
 
 	// Register the mapping context so the engine resolves key→action bindings
 	if (APlayerController* PC = Cast<APlayerController>(GetController()))
@@ -154,11 +164,18 @@ void ASurvivalCharacter::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
+	// Once the match has ended, freeze all further gameplay ticking — the Win/Lose widget owns input now
+	if (bGameOver)
+	{
+		return;
+	}
+
 	// Order matters: hunger falls first, then health responds to hunger being zero,
 	// then stamina recovers independently of the other two.
 	UpdateHunger(DeltaTime);
 	UpdateHealth(DeltaTime);
 	UpdateStamina(DeltaTime);
+	UpdateGameTimer(DeltaTime);
 
 	// Refresh the stat HUD every tick so its progress bars track the stats above in real time
 	if (PlayerStatWidgetInstance)
@@ -170,6 +187,16 @@ void ASurvivalCharacter::Tick(float DeltaTime)
 	if (SelectedBuildType != EBuildPieceType::None)
 	{
 		UpdateBuildPreview();
+	}
+
+	// Win takes priority: if both objectives are done, it doesn't matter whether the clock also ran out this frame
+	if (AreAllObjectivesComplete())
+	{
+		TriggerWin();
+	}
+	else if (TimeRemaining <= 0.f || Health <= 0.f)
+	{
+		TriggerLose();
 	}
 }
 
@@ -514,6 +541,48 @@ void ASurvivalCharacter::RefreshObjectiveHUD()
 	if (ObjectiveWidgetInstance)
 	{
 		ObjectiveWidgetInstance->UpdateObjectives();
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Win/Lose
+// ─────────────────────────────────────────────────────────────────────────────
+
+void ASurvivalCharacter::UpdateGameTimer(float DeltaTime)
+{
+	TimeRemaining = FMath::Max(TimeRemaining - DeltaTime, 0.f);
+}
+
+void ASurvivalCharacter::TriggerWin()
+{
+	EndGame(WinWidgetClass);
+}
+
+void ASurvivalCharacter::TriggerLose()
+{
+	EndGame(LoseWidgetClass);
+}
+
+void ASurvivalCharacter::EndGame(TSubclassOf<UEndGameWidget> WidgetClass)
+{
+	// Guard against double-triggering (e.g. Health hits 0 the same frame objectives complete)
+	if (bGameOver || !WidgetClass)
+	{
+		return;
+	}
+	bGameOver = true;
+
+	if (APlayerController* PC = Cast<APlayerController>(GetController()))
+	{
+		if (UEndGameWidget* EndWidget = CreateWidget<UEndGameWidget>(PC, WidgetClass))
+		{
+			EndWidget->AddToViewport();
+
+			// Hand full control to the end-game widget's Restart/Quit buttons
+			PC->SetInputMode(FInputModeUIOnly());
+			PC->bShowMouseCursor = true;
+			PC->SetPause(true);
+		}
 	}
 }
 

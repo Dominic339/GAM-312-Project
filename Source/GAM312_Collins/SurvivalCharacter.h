@@ -15,6 +15,7 @@ class ABuildableObject;
 class UBuildMenuWidget;
 class UPlayerStatWidget;
 class UObjectiveWidget;
+class UEndGameWidget;
 
 /**
  * First-person player character for the survival game.
@@ -28,6 +29,9 @@ class UObjectiveWidget;
  *   - Building system: opens a build menu widget, spawns a ghost preview of
  *     the selected shelter piece (Wall/Floor/Ceiling), and places it via a
  *     second trace once the player can afford its resource cost
+ *   - Win/lose: a countdown timer runs each tick; completing both objectives
+ *     before it expires shows the Win screen, while running out of time or
+ *     Health reaching 0 shows the Lose screen
  *
  * Setup in the editor:
  *   1. Derive BP_SurvivalCharacter from this class.
@@ -38,6 +42,7 @@ class UObjectiveWidget;
  *      and BuildMenuWidgetClass (WBP_BuildMenu) in the Details panel.
  *   5. Assign PlayerStatWidgetClass (WBP_PlayerStatHUD) in the Details panel.
  *   6. Assign ObjectiveWidgetClass (WBP_ObjectiveHUD) in the Details panel.
+ *   7. Assign WinWidgetClass (WBP_Win) and LoseWidgetClass (WBP_Lose) in the Details panel.
  */
 UCLASS()
 class GAM312_COLLINS_API ASurvivalCharacter : public ACharacter
@@ -228,6 +233,27 @@ private:
 	UPROPERTY(Transient)
 	UObjectiveWidget* ObjectiveWidgetInstance;
 
+	// ── Win/Lose ──────────────────────────────────────────────────────────────
+
+	// How many seconds the player has to complete both objectives; tune in Blueprint Details
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GameState", meta = (AllowPrivateAccess = "true"))
+	float TimeLimit;
+
+	// Counts down from TimeLimit each tick; reaching 0 without both objectives complete is a loss
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GameState", meta = (AllowPrivateAccess = "true"))
+	float TimeRemaining;
+
+	// Widget Blueprint shown when both objectives are completed in time (assign WBP_Win)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GameState", meta = (AllowPrivateAccess = "true"))
+	TSubclassOf<UEndGameWidget> WinWidgetClass;
+
+	// Widget Blueprint shown when time runs out or Health reaches 0 (assign WBP_Lose)
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GameState", meta = (AllowPrivateAccess = "true"))
+	TSubclassOf<UEndGameWidget> LoseWidgetClass;
+
+	// True once the Win or Lose screen has been shown; stops further win/lose checks and stat ticking
+	bool bGameOver;
+
 	// ── Movement ──────────────────────────────────────────────────────────────
 
 	// Top walking speed in cm/s; tunable in Blueprint Details
@@ -268,6 +294,18 @@ private:
 
 	// Pushes fresh progress/completion state to the objective HUD widget, if it exists
 	void RefreshObjectiveHUD();
+
+	// Counts TimeRemaining down each tick; clamps to 0
+	void UpdateGameTimer(float DeltaTime);
+
+	// Shows WinWidgetClass, pauses the game, and frees the mouse cursor
+	void TriggerWin();
+
+	// Shows LoseWidgetClass, pauses the game, and frees the mouse cursor
+	void TriggerLose();
+
+	// Shared win/lose logic: creates WidgetClass, adds it to the viewport, and pauses the game
+	void EndGame(TSubclassOf<UEndGameWidget> WidgetClass);
 
 	// Maps a build piece type to its configured Blueprint class (WallClass/FloorClass/CeilingClass)
 	TSubclassOf<ABuildableObject> GetBuildableClass(EBuildPieceType Type) const;
