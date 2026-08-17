@@ -22,12 +22,20 @@ ASurvivalCharacter::ASurvivalCharacter()
 	PrimaryActorTick.bCanEverTick = true;
 
 	// ── Camera ───────────────────────────────────────────────────────────────
-	// Attach the camera at a standard eye height (64 units ≈ 170 cm scaled)
+	// CAMERA LIBRARIES: UCameraComponent is Unreal's built-in camera system —
+	// attaching one to a Pawn and marking it as the active view target hands
+	// rendering of the player's viewpoint to the engine's own camera pipeline
+	// (view matrix, FOV, projection) instead of requiring us to compute a
+	// view transform by hand. Attach the camera at a standard eye height
+	// (64 units ≈ 170 cm scaled) so it reads as a believable first-person eye level.
 	FirstPersonCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("FirstPersonCamera"));
 	FirstPersonCamera->SetupAttachment(GetRootComponent());
 	FirstPersonCamera->SetRelativeLocation(FVector(0.f, 0.f, 64.f));
 
-	// Camera follows controller rotation so mouse input directly aims the view
+	// CAMERA LIBRARIES: bUsePawnControlRotation tells this camera component to
+	// read the Controller's ControlRotation every frame and orient itself to
+	// match — this is the specific library flag that turns raw mouse input
+	// (handled in Look(), below) into an actual first-person camera view.
 	FirstPersonCamera->bUsePawnControlRotation = true;
 
 	// Yaw rotates the whole character so movement always goes where we're looking
@@ -260,6 +268,13 @@ void ASurvivalCharacter::Move(const FInputActionValue& Value)
 	// MoveAction value type must be Axis2D: X = strafe, Y = forward/back
 	const FVector2D MovementInput = Value.Get<FVector2D>();
 
+	// LINEAR ALGEBRA: GetActorForwardVector()/GetActorRightVector() return the
+	// character's local basis vectors (unit length, mutually perpendicular).
+	// Scaling each by its input axis (a scalar) and summing them via the two
+	// AddMovementInput calls below is exactly the vector operation
+	// finalDirection = (forward * Y) + (right * X) — this is how a flat 2D
+	// stick/WASD input becomes a single 3D world-space movement direction,
+	// without ever hard-coding which way "forward" points on screen.
 	if (Controller)
 	{
 		AddMovementInput(GetActorForwardVector(), MovementInput.Y);
@@ -272,6 +287,10 @@ void ASurvivalCharacter::Look(const FInputActionValue& Value)
 	// LookAction value type must be Axis2D: X = yaw, Y = pitch
 	const FVector2D LookInput = Value.Get<FVector2D>();
 
+	// CAMERA LIBRARIES: these calls add directly to the Controller's
+	// ControlRotation. Because FirstPersonCamera has bUsePawnControlRotation
+	// enabled, it re-reads that rotation every frame — so raw mouse delta here
+	// becomes the camera's actual look direction with no manual view-matrix math.
 	if (Controller)
 	{
 		AddControllerYawInput(LookInput.X);
@@ -285,7 +304,9 @@ void ASurvivalCharacter::Look(const FInputActionValue& Value)
 
 void ASurvivalCharacter::TryInteract()
 {
-	// Build trace ray: starts at the camera (player's eyes), ends at InteractRange
+	// LINEAR ALGEBRA: the trace endpoint is a point-plus-scaled-direction
+	// calculation — TraceEnd = TraceStart + (UnitDirection * Distance) — the
+	// standard vector form of "a point some distance along a ray."
 	const FVector TraceStart = FirstPersonCamera->GetComponentLocation();
 	const FVector TraceEnd   = TraceStart + (FirstPersonCamera->GetForwardVector() * InteractRange);
 
@@ -299,7 +320,14 @@ void ASurvivalCharacter::TryInteract()
 	// Ignore the player's own capsule so we don't immediately hit ourselves
 	QueryParams.AddIgnoredActor(this);
 
-	// Fire the trace on the Visibility channel — interactable meshes must block this channel
+	// TRACE COLLISION: a line trace ("ray cast") checks collision geometry
+	// along a segment instantly, with no physics simulation involved — the
+	// engine walks every collidable primitive that overlaps the segment and
+	// returns the first one whose shape actually blocks it. Collision
+	// *channels* (ECC_Visibility here) let separate systems query separate
+	// subsets of the world: an interactable mesh only needs to block the
+	// Visibility channel to be reachable by this trace, regardless of how it
+	// responds to physics or other gameplay channels.
 	const bool bHit = GetWorld()->LineTraceSingleByChannel(
 		HitResult,
 		TraceStart,
@@ -477,7 +505,11 @@ void ASurvivalCharacter::UpdateBuildPreview()
 		return;
 	}
 
-	// Same trace-from-camera approach as TryInteract, but at building range instead of interact range
+	// TRACE COLLISION: same trace-from-camera approach as TryInteract, but at
+	// building range instead of interact range. We ignore both the player's
+	// own capsule and the preview actor itself so the placement ray passes
+	// through them and reports the real surface behind, rather than
+	// immediately re-hitting the ghost mesh we're trying to position.
 	const FVector TraceStart = FirstPersonCamera->GetComponentLocation();
 	const FVector TraceEnd   = TraceStart + (FirstPersonCamera->GetForwardVector() * BuildPlacementRange);
 
@@ -490,7 +522,11 @@ void ASurvivalCharacter::UpdateBuildPreview()
 
 	if (bLastBuildTraceValid)
 	{
-		// Snap the ghost to the hit point and orient it to the surface it's resting against
+		// LINEAR ALGEBRA: HitResult.Normal is the unit vector perpendicular to
+		// the surface the trace hit; calling .Rotation() converts that direction
+		// vector into the FRotator whose forward axis points the same way, so
+		// the preview piece automatically orients flush against any surface
+		// angle instead of always facing one hard-coded direction.
 		PreviewActor->SetActorLocation(HitResult.Location);
 		PreviewActor->SetActorRotation(HitResult.Normal.Rotation());
 	}
